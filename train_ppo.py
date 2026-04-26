@@ -1,0 +1,902 @@
+from __future__ import annotations
+
+"""
+Train shared-policy PPO on the custom multi-agent MCS environment.
+
+Example:
+  python train_ppo.py --epochs 300 --episodes-per-epoch 2 --device cuda
+"""
+
+import argparse
+import csv
+import json
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+from config import CONFIG
+from env import Environment
+
+
+class PolicyValueNet(nn.Module):
+    def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int) -> None:
+        super().__init__()
+        self.backbone = nn.Sequential(
+            nn.Linear(obs_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+        )
+        self.policy_head = nn.Linear(hidden_dim, action_dim)
+        self.value_head = nn.Linear(hidden_dim, 1)
+
+    def forward(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        h = self.backbone(obs)
+        logits = self.policy_head(h)
+        value = self.value_head(h).squeeze(-1)
+        return logits, value
+
+    @staticmethod
+    def _mask_logits(logits: torch.Tensor, action_mask: torch.Tensor) -> torch.Tensor:
+        return logits.masked_fill(~action_mask, -1e9)
+
+    def act(
+        self,
+        obs: np.ndarray,
+        action_mask: np.ndarray,
+        device: torch.device,
+        deterministic: bool = False,
+    ) -> Tuple[int, float, float]:
+        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+        mask_t = torch.as_tensor(action_mask, dtype=torch.bool, device=device).unsqueeze(0)
+        with torch.no_grad():
+            logits, value = self.forward(obs_t)
+            masked_logits = self._mask_logits(logits, mask_t)
+            dist = torch.distributions.Categorical(logits=masked_logits)
+            if deterministic:
+                action = masked_logits.argmax(dim=-1)
+            else:
+                action = dist.sample()
+            logp = dist.log_prob(action)
+        return int(action.item()), float(logp.item()), float(value.item())
+
+    def value_of_obs(self, obs: np.ndarray, device: torch.device) -> float:
+        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+        with torch.no_grad():
+            _, value = self.forward(obs_t)
+        return float(value.item())
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Train PPO policy for MCS action learning.")
+    p.add_argument("--outdir", type=str, default="result/ppo")
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--use-lstm-summary", action="store_true")
+    p.add_argument("--lstm-predictor-ckpt", type=str, default="")
+
+    p.add_argument("--epochs", type=int, default=1000)
+    p.add_argument("--episodes-per-epoch", type=int, default=4)
+    p.add_argument("--max-steps", type=int, default=None, help="Optional per-episode step cap.")
+
+    p.add_argument("--hidden-dim", type=int, default=128)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--weight-decay", type=float, default=0.0)
+    p.add_argument("--gamma", type=float, default=0.99)
+    p.add_argument("--gae-lambda", type=float, default=0.95)
+
+    p.add_argument("--ppo-clip", type=float, default=0.2)
+    p.add_argument("--update-epochs", type=int, default=4)
+    p.add_argument("--mini-batch-size", type=int, default=2048)
+    p.add_argument("--vf-coef", type=float, default=0.5)
+    p.add_argument("--ent-coef", type=float, default=0.01)
+    p.add_argument("--max-grad-norm", type=float, default=0.5)
+
+    p.add_argument("--eval-every", type=int, default=1)
+    p.add_argument("--eval-episodes", type=int, default=20)
+    p.add_argument("--eval-seed", type=int, default=123)
+    p.add_argument("--eval-max-steps", type=int, default=None)
+    p.add_argument("--eval-stochastic", action="store_true")
+    p.add_argument("--save-epoch-interval", type=int, default=0, help=">0 to save epoch_{k}.pt snapshots every K epochs.")
+    p.add_argument("--rollout-log-interval", type=int, default=0, help="Print rollout progress every N env steps (<=0 disables).")
+    p.add_argument("--update-log-interval", type=int, default=0, help="Print PPO update progress every N mini-batches (<=0 disables).")
+    p.add_argument("--log-flush", action="store_true", help="Flush stdout immediately for real-time logs.")
+    return p.parse_args()
+
+
+def save_ckpt(
+    path: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    args: argparse.Namespace,
+    obs_dim: int,
+    action_dim: int,
+    metrics: Dict[str, float],
+) -> None:
+    payload = {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "epoch": int(epoch),
+        "args": vars(args),
+        "obs_dim": int(obs_dim),
+        "action_dim": int(action_dim),
+        "metrics": metrics,
+    }
+    torch.save(payload, path)
+
+
+def _build_stage_epoch_targets(total_epochs: int) -> Dict[str, int]:
+    total = max(1, int(total_epochs))
+    return {
+        "early": max(1, int(np.ceil(total / 3.0))),
+        "middle": max(1, int(np.ceil(total * 2.0 / 3.0))),
+        "best": total,
+    }
+
+
+def _init_episode_buffers(agents: List[str]) -> Dict[str, Dict[str, List]]:
+    return {
+        a: {
+            "obs": [],
+            "mask": [],
+            "action": [],
+            "logp": [],
+            "value": [],
+            "reward": [],
+            "done": [],
+        }
+        for a in agents
+    }
+
+
+def _build_pending_req_info(req: dict, fallback_step: int) -> Dict[str, float]:
+    return {
+        "step": float(int(req.get("step", fallback_step))),
+        "required_kwh": float(req.get("required_kwh", 0.0)),
+    }
+
+
+def _event_mcs_income(env: Environment, event: dict, req_info: Optional[Dict[str, float]] = None) -> float:
+    mcs_id = int(event.get("mcs_id", -1))
+    mcs = env.mcs_by_id.get(mcs_id)
+    if mcs is None:
+        return 0.0
+
+    distance_km = float(event.get("distance_km", 0.0))
+    income = -distance_km * float(mcs.cost_per_km)
+    if str(event.get("action", "")) == "serve_request":
+        required_kwh = float((req_info or {}).get("required_kwh", 0.0))
+        income += required_kwh * float(mcs.price_per_kwh)
+    return float(income)
+
+
+def _save_business_metrics_csv(path: Path, rows: List[Dict[str, float]]) -> None:
+    if not rows:
+        return
+    fields = [
+        "epoch",
+        "reward",
+        "success_rate",
+        "mcs_avg_income",
+        "ev_avg_wait_minutes",
+        "eval_reward",
+        "eval_success_rate",
+        "eval_mcs_avg_income",
+        "eval_ev_avg_wait_minutes",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, float("nan")) for k in fields})
+
+
+def _plot_business_metrics(path: Path, rows: List[Dict[str, float]]) -> None:
+    if not rows:
+        return
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f"[warn] skip plotting business metrics: {e}")
+        return
+
+    epochs = np.asarray([float(r["epoch"]) for r in rows], dtype=np.float32)
+    reward = np.asarray([float(r["reward"]) for r in rows], dtype=np.float32)
+    success = np.asarray([float(r["success_rate"]) for r in rows], dtype=np.float32)
+    income = np.asarray([float(r["mcs_avg_income"]) for r in rows], dtype=np.float32)
+    wait_min = np.asarray([float(r["ev_avg_wait_minutes"]) for r in rows], dtype=np.float32)
+
+    eval_reward = np.asarray([float(r.get("eval_reward", np.nan)) for r in rows], dtype=np.float32)
+    eval_success = np.asarray([float(r.get("eval_success_rate", np.nan)) for r in rows], dtype=np.float32)
+    eval_income = np.asarray([float(r.get("eval_mcs_avg_income", np.nan)) for r in rows], dtype=np.float32)
+    eval_wait = np.asarray([float(r.get("eval_ev_avg_wait_minutes", np.nan)) for r in rows], dtype=np.float32)
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    plots = [
+        (axes[0, 0], reward, eval_reward, "Reward", "Reward"),
+        (axes[0, 1], success, eval_success, "Success Rate", "Rate"),
+        (axes[1, 0], income, eval_income, "MCS Avg Income", "Income"),
+        (axes[1, 1], wait_min, eval_wait, "EV Avg Wait (min)", "Minutes"),
+    ]
+    for ax, y_train, y_eval, title, ylabel in plots:
+        ax.plot(epochs, y_train, label="train", linewidth=2.0)
+        if np.any(np.isfinite(y_eval)):
+            ax.plot(epochs, y_eval, "--", label="eval", linewidth=1.8)
+        ax.set_title(title)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(ylabel)
+        ax.grid(alpha=0.3)
+        ax.legend()
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def collect_rollouts(
+    env: Environment,
+    model: PolicyValueNet,
+    episodes: int,
+    gamma: float,
+    gae_lambda: float,
+    device: torch.device,
+    rng: np.random.Generator,
+    max_steps: Optional[int],
+    epoch: int = 0,
+    rollout_log_interval: int = 0,
+    log_flush: bool = False,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, float]]:
+    states: List[np.ndarray] = []
+    masks: List[np.ndarray] = []
+    actions: List[int] = []
+    old_logps: List[float] = []
+    returns: List[float] = []
+    advantages: List[float] = []
+    values: List[float] = []
+
+    step_minutes = float(env.config.get("sim_step_minutes", 5))
+    total_steps = 0
+    total_requests = 0
+    mcs_requests = 0
+    success_requests = 0
+    mcs_served = 0
+    unresolved_mcs_total = 0
+    timeout_events_total = 0
+    wait_steps_sum = 0.0
+    wait_count = 0
+    total_agent_reward = 0.0
+    total_mcs_income = 0.0
+
+    total_horizon_target = 0
+    for ep_idx in range(int(episodes)):
+        obs_dict = env.reset(seed=int(rng.integers(1_000_000_000)))
+        agents = env.agents
+        per_agent = _init_episode_buffers(agents)
+        mcs_pending_by_ev: Dict[int, Dict[str, float]] = {}
+        executed_steps = 0
+        episode_done = False
+        ep_requests = 0
+        ep_mcs_requests = 0
+        ep_success_requests = 0
+        ep_mcs_served = 0
+        ep_timeout_events = 0
+        ep_wait_steps_sum = 0.0
+        ep_wait_count = 0
+        ep_agent_reward = 0.0
+        ep_mcs_income = 0.0
+
+        horizon = env.total_steps if max_steps is None else min(int(max_steps), env.total_steps)
+        total_horizon_target += int(horizon)
+        last_obs_dict: Optional[Dict[str, np.ndarray]] = None
+        for _step in range(horizon):
+            action_mask = env.get_action_mask()
+            env_actions: Dict[str, int] = {}
+
+            for agent in agents:
+                obs = np.asarray(obs_dict[agent], dtype=np.float32)
+                mask = np.asarray(action_mask[agent], dtype=np.bool_)
+                act_idx, logp, value = model.act(obs=obs, action_mask=mask, device=device, deterministic=False)
+                env_actions[agent] = int(act_idx + 1)  # env uses 1..4
+
+                per_agent[agent]["obs"].append(obs)
+                per_agent[agent]["mask"].append(mask)
+                per_agent[agent]["action"].append(int(act_idx))
+                per_agent[agent]["logp"].append(float(logp))
+                per_agent[agent]["value"].append(float(value))
+
+            step_result = env.step_parallel(env_actions)
+            executed_steps += 1
+            episode_done = bool(step_result.done)
+
+            for req in step_result.requests:
+                total_requests += 1
+                ep_requests += 1
+                if req.get("service_mode") == "fcs":
+                    success_requests += 1
+                    ep_success_requests += 1
+                else:
+                    mcs_requests += 1
+                    ep_mcs_requests += 1
+                    mcs_pending_by_ev[int(req["ev_id"])] = _build_pending_req_info(req=req, fallback_step=int(step_result.step))
+
+            for event in step_result.mcs_events:
+                action = str(event.get("action", ""))
+                req_info: Optional[Dict[str, float]] = None
+                if action == "serve_request":
+                    ev_id = int(event["ev_id"])
+                    req_info = mcs_pending_by_ev.pop(ev_id, {"step": float(step_result.step), "required_kwh": 0.0})
+                income = _event_mcs_income(env=env, event=event, req_info=req_info)
+                total_mcs_income += income
+                ep_mcs_income += income
+
+                if event.get("action") != "serve_request":
+                    continue
+                req_step = int((req_info or {}).get("step", float(step_result.step)))
+                wait_steps = max(0, int(step_result.step) - int(req_step))
+                mcs_served += 1
+                ep_mcs_served += 1
+                success_requests += 1
+                ep_success_requests += 1
+                wait_steps_sum += float(wait_steps)
+                wait_count += 1
+                ep_wait_steps_sum += float(wait_steps)
+                ep_wait_count += 1
+
+            for timeout_event in step_result.timeout_events:
+                timeout_events_total += 1
+                ep_timeout_events += 1
+                ev_id = int(timeout_event.get("ev_id", -1))
+                req_step = int(timeout_event.get("request_step", step_result.step))
+                wait_steps = int(timeout_event.get("wait_steps", max(0, int(step_result.step) - req_step)))
+                req_info = mcs_pending_by_ev.pop(ev_id, None)
+                if req_info is not None:
+                    req_step = int(req_info.get("step", float(req_step)))
+                wait_steps_sum += float(wait_steps)
+                wait_count += 1
+                ep_wait_steps_sum += float(wait_steps)
+                ep_wait_count += 1
+
+            for agent in agents:
+                rew = float(step_result.agent_rewards[agent])
+                per_agent[agent]["reward"].append(rew)
+                per_agent[agent]["done"].append(1.0 if episode_done else 0.0)
+                total_agent_reward += rew
+                ep_agent_reward += rew
+
+            if rollout_log_interval > 0 and (executed_steps % int(rollout_log_interval) == 0):
+                success_rate_now = float(ep_success_requests / max(1, ep_requests))
+                avg_wait_now = float(ep_wait_steps_sum / ep_wait_count) if ep_wait_count > 0 else 0.0
+                print(
+                    f"[rollout][epoch={epoch:03d}] "
+                    f"ep={ep_idx + 1}/{int(episodes)} step={executed_steps}/{horizon} "
+                    f"succ={success_rate_now:.3f} wait={avg_wait_now * step_minutes:.2f}min "
+                    f"pending={len(env.pending_ev_requests)} timeout={ep_timeout_events}",
+                    flush=log_flush,
+                )
+
+            if episode_done:
+                last_obs_dict = None
+                break
+
+            obs_dict = env.get_agent_observations()
+            last_obs_dict = obs_dict
+
+        for req_info in mcs_pending_by_ev.values():
+            req_step = int(req_info.get("step", float(executed_steps - 1)))
+            wait_steps = max(0, int(executed_steps - 1) - req_step)
+            wait_steps_sum += float(wait_steps)
+            wait_count += 1
+            ep_wait_steps_sum += float(wait_steps)
+            ep_wait_count += 1
+        unresolved_mcs_total += len(mcs_pending_by_ev)
+        total_steps += executed_steps
+
+        ep_success_rate = float(ep_success_requests / max(1, ep_requests))
+        ep_mcs_success_rate = float(ep_mcs_served / max(1, ep_mcs_requests))
+        ep_avg_wait_steps = float(ep_wait_steps_sum / ep_wait_count) if ep_wait_count > 0 else 0.0
+        if rollout_log_interval > 0:
+            print(
+                f"[rollout][epoch={epoch:03d}] "
+                f"ep={ep_idx + 1}/{int(episodes)} done "
+                f"steps={executed_steps}/{horizon} "
+                f"succ={ep_success_rate:.3f} mcs_succ={ep_mcs_success_rate:.3f} "
+                f"wait={ep_avg_wait_steps * step_minutes:.2f}min timeout={ep_timeout_events} "
+                f"reward={ep_agent_reward:.2f} mcs_income={ep_mcs_income:.2f}",
+                flush=log_flush,
+            )
+
+        for agent in agents:
+            buf = per_agent[agent]
+            if not buf["reward"]:
+                continue
+
+            rewards_np = np.asarray(buf["reward"], dtype=np.float32)
+            dones_np = np.asarray(buf["done"], dtype=np.float32)
+            values_np = np.asarray(buf["value"], dtype=np.float32)
+            adv_np = np.zeros_like(rewards_np, dtype=np.float32)
+            ret_np = np.zeros_like(rewards_np, dtype=np.float32)
+
+            if episode_done or last_obs_dict is None:
+                bootstrap_value = 0.0
+            else:
+                bootstrap_value = model.value_of_obs(np.asarray(last_obs_dict[agent], dtype=np.float32), device=device)
+
+            gae = 0.0
+            next_value = float(bootstrap_value)
+            for t in range(len(rewards_np) - 1, -1, -1):
+                delta = rewards_np[t] + gamma * (1.0 - dones_np[t]) * next_value - values_np[t]
+                gae = delta + gamma * gae_lambda * (1.0 - dones_np[t]) * gae
+                adv_np[t] = gae
+                ret_np[t] = gae + values_np[t]
+                next_value = float(values_np[t])
+
+            states.extend(buf["obs"])
+            masks.extend(buf["mask"])
+            actions.extend(buf["action"])
+            old_logps.extend(buf["logp"])
+            values.extend(buf["value"])
+            returns.extend(ret_np.tolist())
+            advantages.extend(adv_np.tolist())
+
+    if len(actions) == 0:
+        raise RuntimeError("No rollout transitions collected.")
+
+    avg_wait_steps = float(wait_steps_sum / wait_count) if wait_count > 0 else 0.0
+    rollout_stats = {
+        "episodes": float(episodes),
+        "transitions": float(len(actions)),
+        "steps": float(total_steps),
+        "steps_target": float(total_horizon_target),
+        "requests": float(total_requests),
+        "success_rate": float(success_requests / max(1, total_requests)),
+        "mcs_success_rate": float(mcs_served / max(1, mcs_requests)),
+        "avg_wait_steps": float(avg_wait_steps),
+        "avg_wait_minutes": float(avg_wait_steps * step_minutes),
+        "unresolved_mcs_total": float(unresolved_mcs_total),
+        "timeout_events_total": float(timeout_events_total),
+        "avg_total_agent_reward_per_ep": float(total_agent_reward / max(1, int(episodes))),
+        "avg_reward_per_transition": float(total_agent_reward / max(1, len(actions))),
+        "mcs_total_income": float(total_mcs_income),
+        "mcs_avg_income": float(total_mcs_income / max(1.0, float(int(episodes) * len(env.mcs_list)))),
+    }
+    batch = {
+        "states": np.asarray(states, dtype=np.float32),
+        "masks": np.asarray(masks, dtype=np.bool_),
+        "actions": np.asarray(actions, dtype=np.int64),
+        "old_logps": np.asarray(old_logps, dtype=np.float32),
+        "returns": np.asarray(returns, dtype=np.float32),
+        "advantages": np.asarray(advantages, dtype=np.float32),
+        "values": np.asarray(values, dtype=np.float32),
+    }
+    return batch, rollout_stats
+
+
+def ppo_update(
+    model: PolicyValueNet,
+    optimizer: torch.optim.Optimizer,
+    batch: Dict[str, np.ndarray],
+    args: argparse.Namespace,
+    device: torch.device,
+    rng: np.random.Generator,
+    epoch: int = 0,
+    update_log_interval: int = 0,
+    log_flush: bool = False,
+) -> Dict[str, float]:
+    states_t = torch.as_tensor(batch["states"], dtype=torch.float32, device=device)
+    masks_t = torch.as_tensor(batch["masks"], dtype=torch.bool, device=device)
+    actions_t = torch.as_tensor(batch["actions"], dtype=torch.long, device=device)
+    old_logps_t = torch.as_tensor(batch["old_logps"], dtype=torch.float32, device=device)
+    returns_t = torch.as_tensor(batch["returns"], dtype=torch.float32, device=device)
+    adv_t = torch.as_tensor(batch["advantages"], dtype=torch.float32, device=device)
+
+    adv_t = (adv_t - adv_t.mean()) / (adv_t.std(unbiased=False) + 1e-8)
+    n = int(states_t.shape[0])
+
+    p_loss_all: List[float] = []
+    v_loss_all: List[float] = []
+    ent_all: List[float] = []
+    kl_all: List[float] = []
+    clipfrac_all: List[float] = []
+    total_loss_all: List[float] = []
+    mb_counter = 0
+    mb_total = int(args.update_epochs) * int(np.ceil(float(n) / max(1, int(args.mini_batch_size))))
+
+    for _ in range(int(args.update_epochs)):
+        perm = rng.permutation(n)
+        for start in range(0, n, int(args.mini_batch_size)):
+            idx = perm[start : start + int(args.mini_batch_size)]
+            mb_states = states_t[idx]
+            mb_masks = masks_t[idx]
+            mb_actions = actions_t[idx]
+            mb_old_logps = old_logps_t[idx]
+            mb_returns = returns_t[idx]
+            mb_adv = adv_t[idx]
+
+            logits, values = model(mb_states)
+            masked_logits = logits.masked_fill(~mb_masks, -1e9)
+            dist = torch.distributions.Categorical(logits=masked_logits)
+            new_logps = dist.log_prob(mb_actions)
+            entropy = dist.entropy().mean()
+
+            ratio = torch.exp(new_logps - mb_old_logps)
+            surr1 = ratio * mb_adv
+            surr2 = torch.clamp(ratio, 1.0 - float(args.ppo_clip), 1.0 + float(args.ppo_clip)) * mb_adv
+            p_loss = -torch.min(surr1, surr2).mean()
+            v_loss = F.mse_loss(values, mb_returns)
+            total_loss = p_loss + float(args.vf_coef) * v_loss - float(args.ent_coef) * entropy
+
+            optimizer.zero_grad(set_to_none=True)
+            total_loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), float(args.max_grad_norm))
+            optimizer.step()
+
+            with torch.no_grad():
+                approx_kl = (mb_old_logps - new_logps).mean()
+                clip_frac = (torch.abs(ratio - 1.0) > float(args.ppo_clip)).float().mean()
+
+            p_loss_all.append(float(p_loss.item()))
+            v_loss_all.append(float(v_loss.item()))
+            ent_all.append(float(entropy.item()))
+            kl_all.append(float(approx_kl.item()))
+            clipfrac_all.append(float(clip_frac.item()))
+            total_loss_all.append(float(total_loss.item()))
+            mb_counter += 1
+
+            if update_log_interval > 0 and (mb_counter % int(update_log_interval) == 0 or mb_counter == mb_total):
+                print(
+                    f"[update][epoch={epoch:03d}] mb={mb_counter}/{mb_total} "
+                    f"loss={float(np.mean(total_loss_all)):.4f} "
+                    f"policy={float(np.mean(p_loss_all)):.4f} "
+                    f"value={float(np.mean(v_loss_all)):.4f} "
+                    f"ent={float(np.mean(ent_all)):.4f} "
+                    f"kl={float(np.mean(kl_all)):.5f} "
+                    f"clip={float(np.mean(clipfrac_all)):.4f}",
+                    flush=log_flush,
+                )
+
+    return {
+        "loss": float(np.mean(total_loss_all)),
+        "policy_loss": float(np.mean(p_loss_all)),
+        "value_loss": float(np.mean(v_loss_all)),
+        "entropy": float(np.mean(ent_all)),
+        "approx_kl": float(np.mean(kl_all)),
+        "clipfrac": float(np.mean(clipfrac_all)),
+    }
+
+
+def evaluate_policy(
+    model: PolicyValueNet,
+    env_config: dict,
+    episodes: int,
+    seed: int,
+    device: torch.device,
+    deterministic: bool,
+    max_steps: Optional[int],
+) -> Dict[str, float]:
+    if episodes <= 0:
+        return {}
+
+    env = Environment(config=env_config, seed=seed)
+    step_minutes = float(env.config.get("sim_step_minutes", 5))
+
+    total_steps = 0
+    total_requests = 0
+    mcs_requests = 0
+    success_requests = 0
+    mcs_served = 0
+    unresolved_mcs_total = 0
+    timeout_events_total = 0
+    wait_steps_sum = 0.0
+    wait_count = 0
+    total_agent_reward = 0.0
+    total_mcs_income = 0.0
+
+    for ep in range(int(episodes)):
+        obs_dict = env.reset(seed=int(seed + (ep + 1) * 9973))
+        mcs_pending_by_ev: Dict[int, Dict[str, float]] = {}
+        executed_steps = 0
+        horizon = env.total_steps if max_steps is None else min(int(max_steps), env.total_steps)
+
+        for _ in range(horizon):
+            action_mask = env.get_action_mask()
+            env_actions: Dict[str, int] = {}
+            for agent in env.agents:
+                obs = np.asarray(obs_dict[agent], dtype=np.float32)
+                mask = np.asarray(action_mask[agent], dtype=np.bool_)
+                act_idx, _, _ = model.act(
+                    obs=obs,
+                    action_mask=mask,
+                    device=device,
+                    deterministic=deterministic,
+                )
+                env_actions[agent] = int(act_idx + 1)
+
+            step_result = env.step_parallel(env_actions)
+            executed_steps += 1
+
+            for req in step_result.requests:
+                total_requests += 1
+                if req.get("service_mode") == "fcs":
+                    success_requests += 1
+                else:
+                    mcs_requests += 1
+                    mcs_pending_by_ev[int(req["ev_id"])] = _build_pending_req_info(req=req, fallback_step=int(step_result.step))
+
+            for event in step_result.mcs_events:
+                action = str(event.get("action", ""))
+                req_info: Optional[Dict[str, float]] = None
+                if action == "serve_request":
+                    ev_id = int(event["ev_id"])
+                    req_info = mcs_pending_by_ev.pop(ev_id, {"step": float(step_result.step), "required_kwh": 0.0})
+                total_mcs_income += _event_mcs_income(env=env, event=event, req_info=req_info)
+
+                if event.get("action") != "serve_request":
+                    continue
+                req_step = int((req_info or {}).get("step", float(step_result.step)))
+                wait_steps = max(0, int(step_result.step) - int(req_step))
+                mcs_served += 1
+                success_requests += 1
+                wait_steps_sum += float(wait_steps)
+                wait_count += 1
+
+            for timeout_event in step_result.timeout_events:
+                timeout_events_total += 1
+                ev_id = int(timeout_event.get("ev_id", -1))
+                req_step = int(timeout_event.get("request_step", step_result.step))
+                wait_steps = int(timeout_event.get("wait_steps", max(0, int(step_result.step) - req_step)))
+                req_info = mcs_pending_by_ev.pop(ev_id, None)
+                if req_info is not None:
+                    req_step = int(req_info.get("step", float(req_step)))
+                wait_steps_sum += float(wait_steps)
+                wait_count += 1
+
+            for agent in env.agents:
+                total_agent_reward += float(step_result.agent_rewards[agent])
+
+            if step_result.done:
+                break
+            obs_dict = env.get_agent_observations()
+
+        for req_info in mcs_pending_by_ev.values():
+            req_step = int(req_info.get("step", float(executed_steps - 1)))
+            wait_steps = max(0, int(executed_steps - 1) - req_step)
+            wait_steps_sum += float(wait_steps)
+            wait_count += 1
+        unresolved_mcs_total += len(mcs_pending_by_ev)
+        total_steps += executed_steps
+
+    avg_wait_steps = float(wait_steps_sum / wait_count) if wait_count > 0 else 0.0
+    return {
+        "episodes": float(episodes),
+        "steps": float(total_steps),
+        "requests": float(total_requests),
+        "success_rate": float(success_requests / max(1, total_requests)),
+        "mcs_success_rate": float(mcs_served / max(1, mcs_requests)),
+        "avg_wait_steps": float(avg_wait_steps),
+        "avg_wait_minutes": float(avg_wait_steps * step_minutes),
+        "unresolved_mcs_total": float(unresolved_mcs_total),
+        "timeout_events_total": float(timeout_events_total),
+        "avg_total_agent_reward_per_ep": float(total_agent_reward / max(1, int(episodes))),
+        "mcs_total_income": float(total_mcs_income),
+        "mcs_avg_income": float(total_mcs_income / max(1.0, float(int(episodes) * len(env.mcs_list)))),
+    }
+
+
+def main() -> None:
+    args = parse_args()
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    rng = np.random.default_rng(args.seed)
+
+    device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    ppo_cfg = dict(CONFIG)
+    ppo_cfg["use_lstm_summary"] = bool(args.use_lstm_summary)
+    if args.lstm_predictor_ckpt:
+        ppo_cfg["lstm_predictor_ckpt"] = str(args.lstm_predictor_ckpt)
+    env = Environment(config=ppo_cfg, seed=args.seed)
+    obs_dict = env.reset(seed=args.seed)
+    obs_dim = int(next(iter(obs_dict.values())).shape[0])
+    action_dim = int(len(env.ACTION_SPACE))
+
+    model = PolicyValueNet(obs_dim=obs_dim, action_dim=action_dim, hidden_dim=int(args.hidden_dim)).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
+
+    total_epochs = int(args.epochs)
+    stage_epoch_targets = _build_stage_epoch_targets(total_epochs=total_epochs)
+    stage_names_by_epoch: Dict[int, List[str]] = {}
+    for stage_name, stage_epoch in stage_epoch_targets.items():
+        stage_names_by_epoch.setdefault(int(stage_epoch), []).append(str(stage_name))
+
+    best_sim_success = float("-inf")
+    best_sim_reward = float("-inf")
+    best_sim_wait = float("inf")
+    log_path = outdir / "ppo_log.jsonl"
+    if log_path.exists():
+        log_path.unlink()
+
+    print(
+        f"ppo_init obs_dim={obs_dim} action_dim={action_dim} device={device} epochs={args.epochs} "
+        f"use_lstm_summary={bool(args.use_lstm_summary)}"
+    )
+    print(
+        f"stage_ckpt_targets early={stage_epoch_targets['early']:03d} "
+        f"middle={stage_epoch_targets['middle']:03d} best={stage_epoch_targets['best']:03d}",
+        flush=bool(args.log_flush),
+    )
+    business_history: List[Dict[str, float]] = []
+
+    for epoch in range(1, total_epochs + 1):
+        model.train()
+        rollout_batch, rollout_stats = collect_rollouts(
+            env=env,
+            model=model,
+            episodes=int(args.episodes_per_epoch),
+            gamma=float(args.gamma),
+            gae_lambda=float(args.gae_lambda),
+            device=device,
+            rng=rng,
+            max_steps=args.max_steps,
+            epoch=epoch,
+            rollout_log_interval=int(args.rollout_log_interval),
+            log_flush=bool(args.log_flush),
+        )
+        update_stats = ppo_update(
+            model=model,
+            optimizer=optimizer,
+            batch=rollout_batch,
+            args=args,
+            device=device,
+            rng=rng,
+            epoch=epoch,
+            update_log_interval=int(args.update_log_interval),
+            log_flush=bool(args.log_flush),
+        )
+
+        eval_stats: Dict[str, float] = {}
+        if int(args.eval_every) > 0 and epoch % int(args.eval_every) == 0:
+            model.eval()
+            eval_stats = evaluate_policy(
+                model=model,
+                env_config=ppo_cfg,
+                episodes=int(args.eval_episodes),
+                seed=int(args.eval_seed + epoch),
+                device=device,
+                deterministic=not bool(args.eval_stochastic),
+                max_steps=args.eval_max_steps,
+            )
+
+        merged_for_ckpt = {**rollout_stats, **update_stats, **eval_stats}
+        save_ckpt(
+            path=outdir / "last.pt",
+            model=model,
+            optimizer=optimizer,
+            epoch=epoch,
+            args=args,
+            obs_dim=obs_dim,
+            action_dim=action_dim,
+            metrics=merged_for_ckpt,
+        )
+        if int(args.save_epoch_interval) > 0 and epoch % int(args.save_epoch_interval) == 0:
+            save_ckpt(
+                path=outdir / f"epoch_{epoch:03d}.pt",
+                model=model,
+                optimizer=optimizer,
+                epoch=epoch,
+                args=args,
+                obs_dim=obs_dim,
+                action_dim=action_dim,
+                metrics=merged_for_ckpt,
+            )
+        for stage_name in stage_names_by_epoch.get(int(epoch), []):
+            stage_path = outdir / f"stage_{stage_name}.pt"
+            save_ckpt(
+                path=stage_path,
+                model=model,
+                optimizer=optimizer,
+                epoch=epoch,
+                args=args,
+                obs_dim=obs_dim,
+                action_dim=action_dim,
+                metrics=merged_for_ckpt,
+            )
+
+        if eval_stats:
+            sim_success = float(eval_stats.get("success_rate", -1.0))
+            if sim_success > best_sim_success:
+                best_sim_success = sim_success
+                save_ckpt(
+                    path=outdir / "best.pt",
+                    model=model,
+                    optimizer=optimizer,
+                    epoch=epoch,
+                    args=args,
+                    obs_dim=obs_dim,
+                    action_dim=action_dim,
+                    metrics=merged_for_ckpt,
+                )
+                save_ckpt(
+                    path=outdir / "best_by_success.pt",
+                    model=model,
+                    optimizer=optimizer,
+                    epoch=epoch,
+                    args=args,
+                    obs_dim=obs_dim,
+                    action_dim=action_dim,
+                    metrics=merged_for_ckpt,
+                )
+            sim_reward = float(eval_stats.get("avg_total_agent_reward_per_ep", float("-inf")))
+            if sim_reward > best_sim_reward:
+                best_sim_reward = sim_reward
+                save_ckpt(
+                    path=outdir / "best_by_reward.pt",
+                    model=model,
+                    optimizer=optimizer,
+                    epoch=epoch,
+                    args=args,
+                    obs_dim=obs_dim,
+                    action_dim=action_dim,
+                    metrics=merged_for_ckpt,
+                )
+            sim_wait = float(eval_stats.get("avg_wait_minutes", float("inf")))
+            if sim_wait < best_sim_wait:
+                best_sim_wait = sim_wait
+                save_ckpt(
+                    path=outdir / "best_by_wait.pt",
+                    model=model,
+                    optimizer=optimizer,
+                    epoch=epoch,
+                    args=args,
+                    obs_dim=obs_dim,
+                    action_dim=action_dim,
+                    metrics=merged_for_ckpt,
+                )
+
+        summary = {
+            "epoch": int(epoch),
+            "collect": rollout_stats,
+            "update": update_stats,
+            "eval": eval_stats,
+            "lr": float(optimizer.param_groups[0]["lr"]),
+        }
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(summary, ensure_ascii=False) + "\n")
+
+        biz_row = {
+            "epoch": float(epoch),
+            "reward": float(rollout_stats.get("avg_total_agent_reward_per_ep", 0.0)),
+            "success_rate": float(rollout_stats.get("success_rate", 0.0)),
+            "mcs_avg_income": float(rollout_stats.get("mcs_avg_income", 0.0)),
+            "ev_avg_wait_minutes": float(rollout_stats.get("avg_wait_minutes", 0.0)),
+            "eval_reward": float(eval_stats.get("avg_total_agent_reward_per_ep", np.nan)) if eval_stats else float("nan"),
+            "eval_success_rate": float(eval_stats.get("success_rate", np.nan)) if eval_stats else float("nan"),
+            "eval_mcs_avg_income": float(eval_stats.get("mcs_avg_income", np.nan)) if eval_stats else float("nan"),
+            "eval_ev_avg_wait_minutes": float(eval_stats.get("avg_wait_minutes", np.nan)) if eval_stats else float("nan"),
+        }
+        business_history.append(biz_row)
+        print(
+            f"epoch={epoch:03d} "
+            f"collect_success={rollout_stats['success_rate']:.3f} "
+            f"collect_wait={rollout_stats['avg_wait_minutes']:.2f}min "
+            f"reward={biz_row['reward']:.3f}",
+            flush=bool(args.log_flush),
+        )
+
+    biz_csv = outdir / "business_metrics.csv"
+    biz_png = outdir / "business_metrics.png"
+    _save_business_metrics_csv(path=biz_csv, rows=business_history)
+    _plot_business_metrics(path=biz_png, rows=business_history)
+    print(f"saved business metrics: {biz_csv}")
+    print(f"saved business plot: {biz_png}")
+    print(f"done: checkpoints/log in {outdir}")
+
+
+if __name__ == "__main__":
+    main()
