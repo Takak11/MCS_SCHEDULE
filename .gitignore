@@ -1,4 +1,5 @@
-dataprocessor/dataset/
+dataprocessor/dataset
+dataprocessor/__pycache__
 result/
 dataset/
 .idea/
