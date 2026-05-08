@@ -49,16 +49,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-grad-norm", type=float, default=0.5)
     p.add_argument("--policy-warmup-epochs", type=int, default=10, help="Freeze the DT policy trunk and train only value head during early epochs.")
     p.add_argument("--warmup-kl-mult", type=float, default=4.0)
-    p.add_argument("--reward-profile", type=str, default="business", choices=["business", "config"])
+    p.add_argument("--reward-profile", type=str, default="config", choices=["business", "config"])
     p.add_argument("--stability-guard", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--guard-until-epoch", type=int, default=80)
     p.add_argument("--guard-success-drop", type=float, default=0.08)
     p.add_argument("--guard-wait-increase-minutes", type=float, default=5.0)
     p.add_argument("--guard-lr-decay", type=float, default=0.5)
-    p.add_argument("--business-success-weight", type=float, default=1000.0)
-    p.add_argument("--business-income-weight", type=float, default=0.1)
-    p.add_argument("--business-wait-weight", type=float, default=25.0)
-    p.add_argument("--business-timeout-weight", type=float, default=0.05)
     p.add_argument("--eval-every", type=int, default=1)
     p.add_argument("--eval-episodes", type=int, default=20)
     p.add_argument("--eval-seed", type=int, default=123)
@@ -194,15 +190,10 @@ def _plot_business_metrics(path: Path, rows: List[Dict[str, float]]) -> None:
 
 def _business_score(stats: Dict[str, float], args: argparse.Namespace) -> float:
     success = float(stats.get("success_rate", 0.0))
-    income = float(stats.get("mcs_avg_income", 0.0))
+    mcs_success = float(stats.get("mcs_success_rate", 0.0))
     wait = float(stats.get("avg_wait_minutes", 0.0))
     timeouts = float(stats.get("timeout_events_total", 0.0))
-    return float(
-        float(args.business_success_weight) * success
-        + float(args.business_income_weight) * income
-        - float(args.business_wait_weight) * wait
-        - float(args.business_timeout_weight) * timeouts
-    )
+    return float(1000.0 * success + 300.0 * mcs_success - 25.0 * wait - 0.05 * timeouts)
 
 
 def _apply_reward_profile(env_cfg: dict, profile: str) -> dict:
@@ -210,22 +201,26 @@ def _apply_reward_profile(env_cfg: dict, profile: str) -> dict:
         return env_cfg
     env_cfg.update(
         {
-            "reward_service_reward": 4.5,
-            "reward_fast_service_bonus": 1.5,
-            "reward_waiting_penalty": 0.12,
-            "reward_serve_wait_penalty": 0.05,
-            "reward_timeout_penalty": 3.0,
-            "reward_timeout_wait_penalty": 0.05,
-            "reward_pending_count_penalty": 0.015,
-            "reward_empty_drive_penalty": 0.015,
-            "reward_fcs_overload_penalty": 0.15,
+            "reward_service_reward": 6.0,
+            "reward_fast_service_bonus": 3.0,
+            "reward_waiting_penalty": 0.18,
+            "reward_serve_wait_penalty": 0.10,
+            "reward_timeout_penalty": 6.0,
+            "reward_timeout_wait_penalty": 0.12,
+            "reward_pending_count_penalty": 0.025,
+            "reward_empty_drive_penalty": 0.012,
+            "reward_fcs_overload_penalty": 0.10,
             "reward_crowd_penalty": 0.03,
-            "reward_invalid_action_penalty": 2.5,
-            "reward_shape_relocate_scale": 0.2,
-            "reward_shape_reinforce_scale": 0.25,
-            "reward_shape_stay_scale": 0.15,
-            "reward_shape_clip": 0.3,
-            "reward_clip_abs": 8.0,
+            "reward_invalid_action_penalty": 3.0,
+            "reward_success_rate_bonus": 2.0,
+            "reward_mcs_success_rate_bonus": 1.0,
+            "reward_wait_improvement_bonus": 0.8,
+            "reward_income_scale": 0.02,
+            "reward_shape_relocate_scale": 0.08,
+            "reward_shape_reinforce_scale": 0.10,
+            "reward_shape_stay_scale": 0.05,
+            "reward_shape_clip": 0.15,
+            "reward_clip_abs": 12.0,
         }
     )
     return env_cfg

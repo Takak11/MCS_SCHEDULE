@@ -10,6 +10,7 @@ Example:
 import argparse
 import csv
 import json
+import shutil
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -95,6 +96,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vf-coef", type=float, default=0.5)
     p.add_argument("--ent-coef", type=float, default=0.01)
     p.add_argument("--max-grad-norm", type=float, default=0.5)
+    p.add_argument("--stage-snapshot-all", action=argparse.BooleanOptionalAction, default=True)
 
     p.add_argument("--eval-every", type=int, default=1)
     p.add_argument("--eval-episodes", type=int, default=20)
@@ -139,6 +141,117 @@ def _build_stage_epoch_targets(total_epochs: int) -> Dict[str, int]:
     }
 
 
+def _row_metric_business_score(row: Dict[str, float]) -> float:
+    eval_score = float(row.get("eval_business_score", np.nan))
+    if np.isfinite(eval_score):
+        return eval_score
+    return float(row.get("business_score", np.nan))
+
+
+def _smooth_curve(values: np.ndarray) -> np.ndarray:
+    if values.size < 5:
+        return values.astype(np.float64, copy=True)
+    window = int(min(11, max(3, values.size // 30)))
+    if window % 2 == 0:
+        window += 1
+    pad = window // 2
+    padded = np.pad(values.astype(np.float64), (pad, pad), mode="edge")
+    kernel = np.ones((window,), dtype=np.float64) / float(window)
+    return np.convolve(padded, kernel, mode="valid")
+
+
+def _convergence_midpoint_row(valid_rows: List[Dict[str, float]]) -> Dict[str, float]:
+    scores = np.asarray([_row_metric_business_score(r) for r in valid_rows], dtype=np.float64)
+    smooth = _smooth_curve(scores)
+    best_score = float(np.max(smooth))
+    worst_idx = int(np.argmin(smooth))
+    worst_score = float(smooth[worst_idx])
+    band = max(1e-6, best_score - worst_score)
+    threshold = best_score - 0.05 * band
+
+    converge_idx = int(np.argmax(smooth >= threshold))
+    if converge_idx <= worst_idx:
+        later = np.where(smooth[worst_idx:] >= threshold)[0]
+        if later.size > 0:
+            converge_idx = int(worst_idx + later[0])
+        else:
+            converge_idx = int(np.argmax(smooth))
+
+    start_idx = int(worst_idx)
+    end_idx = int(converge_idx)
+    if end_idx < start_idx:
+        start_idx, end_idx = end_idx, start_idx
+
+    start_epoch = float(valid_rows[start_idx]["epoch"])
+    end_epoch = float(valid_rows[end_idx]["epoch"])
+    mid_epoch = (start_epoch + end_epoch) / 2.0
+    candidates = valid_rows[start_idx : end_idx + 1] if end_idx >= start_idx else valid_rows
+    row = min(candidates, key=lambda r: abs(float(r["epoch"]) - mid_epoch))
+    return {
+        **row,
+        "stage_role": "worst_to_convergence_midpoint",
+        "convergence_start_epoch": float(start_epoch),
+        "convergence_end_epoch": float(end_epoch),
+        "convergence_start_score": float(scores[start_idx]),
+        "convergence_end_score": float(scores[end_idx]),
+        "convergence_threshold_score": float(threshold),
+        "stage_metric_business_score": float(_row_metric_business_score(row)),
+    }
+
+
+def _rapid_rise_midpoint_row(valid_rows: List[Dict[str, float]]) -> Dict[str, float]:
+    # Kept for backwards-compatible summaries; middle now uses convergence midpoint.
+    scores = np.asarray([_row_metric_business_score(r) for r in valid_rows], dtype=np.float64)
+    smooth = _smooth_curve(scores)
+    slopes = np.diff(smooth)
+    if slopes.size <= 0:
+        start_idx = end_idx = 0
+    else:
+        max_slope = float(np.max(slopes))
+        if max_slope <= 0.0:
+            start_idx = end_idx = int(np.argmax(scores))
+        else:
+            peak_idx = int(np.argmax(slopes))
+            threshold = 0.30 * max_slope
+            start_idx = peak_idx
+            end_idx = min(peak_idx + 1, len(valid_rows) - 1)
+            while start_idx > 0 and float(slopes[start_idx - 1]) >= threshold:
+                start_idx -= 1
+            while end_idx < int(slopes.size) and float(slopes[end_idx]) >= threshold:
+                end_idx += 1
+
+    start_epoch = float(valid_rows[start_idx]["epoch"])
+    end_epoch = float(valid_rows[end_idx]["epoch"])
+    mid_epoch = (start_epoch + end_epoch) / 2.0
+    lo, hi = sorted((start_idx, end_idx))
+    candidates = valid_rows[lo : hi + 1] if hi >= lo else valid_rows
+    row = min(candidates, key=lambda r: abs(float(r["epoch"]) - mid_epoch))
+    return {
+        **row,
+        "stage_role": "rapid_rise_midpoint",
+        "rapid_rise_start_epoch": float(start_epoch),
+        "rapid_rise_end_epoch": float(end_epoch),
+        "rapid_rise_start_score": float(scores[start_idx]),
+        "rapid_rise_end_score": float(scores[end_idx]),
+        "stage_metric_business_score": float(_row_metric_business_score(row)),
+    }
+
+
+def _select_stage_rows(rows: List[Dict[str, float]]) -> Dict[str, Dict[str, float]]:
+    valid = sorted(
+        [r for r in rows if np.isfinite(_row_metric_business_score(r))],
+        key=lambda r: float(r["epoch"]),
+    )
+    if not valid:
+        return {}
+    random_row = {
+        **valid[0],
+        "stage_role": "epoch_001_random",
+        "stage_metric_business_score": float(_row_metric_business_score(valid[0])),
+    }
+    return {"early": random_row, "middle": _convergence_midpoint_row(valid)}
+
+
 def _init_episode_buffers(agents: List[str]) -> Dict[str, Dict[str, List]]:
     return {
         a: {
@@ -175,6 +288,14 @@ def _event_mcs_income(env: Environment, event: dict, req_info: Optional[Dict[str
     return float(income)
 
 
+def _business_score(stats: Dict[str, float], args: argparse.Namespace) -> float:
+    success = float(stats.get("success_rate", 0.0))
+    mcs_success = float(stats.get("mcs_success_rate", 0.0))
+    wait = float(stats.get("avg_wait_minutes", 0.0))
+    timeouts = float(stats.get("timeout_events_total", 0.0))
+    return float(1000.0 * success + 300.0 * mcs_success - 25.0 * wait - 0.05 * timeouts)
+
+
 def _save_business_metrics_csv(path: Path, rows: List[Dict[str, float]]) -> None:
     if not rows:
         return
@@ -184,10 +305,12 @@ def _save_business_metrics_csv(path: Path, rows: List[Dict[str, float]]) -> None
         "success_rate",
         "mcs_avg_income",
         "ev_avg_wait_minutes",
+        "business_score",
         "eval_reward",
         "eval_success_rate",
         "eval_mcs_avg_income",
         "eval_ev_avg_wait_minutes",
+        "eval_business_score",
     ]
     with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
@@ -710,25 +833,25 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
 
     total_epochs = int(args.epochs)
-    stage_epoch_targets = _build_stage_epoch_targets(total_epochs=total_epochs)
-    stage_names_by_epoch: Dict[int, List[str]] = {}
-    for stage_name, stage_epoch in stage_epoch_targets.items():
-        stage_names_by_epoch.setdefault(int(stage_epoch), []).append(str(stage_name))
+    _build_stage_epoch_targets(total_epochs=total_epochs)
 
+    best_sim_business = float("-inf")
     best_sim_success = float("-inf")
     best_sim_reward = float("-inf")
     best_sim_wait = float("inf")
     log_path = outdir / "ppo_log.jsonl"
     if log_path.exists():
         log_path.unlink()
+    stage_snapshot_dir = outdir / "stage_snapshots"
+    if bool(args.stage_snapshot_all):
+        stage_snapshot_dir.mkdir(parents=True, exist_ok=True)
 
     print(
         f"ppo_init obs_dim={obs_dim} action_dim={action_dim} device={device} epochs={args.epochs} "
         f"use_lstm_summary={bool(args.use_lstm_summary)}"
     )
     print(
-        f"stage_ckpt_targets early={stage_epoch_targets['early']:03d} "
-        f"middle={stage_epoch_targets['middle']:03d} best={stage_epoch_targets['best']:03d}",
+        "stage_ckpt_targets early=epoch_001 middle=worst_to_convergence_midpoint business=best_by_business",
         flush=bool(args.log_flush),
     )
     business_history: List[Dict[str, float]] = []
@@ -773,7 +896,11 @@ def main() -> None:
                 max_steps=args.eval_max_steps,
             )
 
-        merged_for_ckpt = {**rollout_stats, **update_stats, **eval_stats}
+        collect_business_score = _business_score(rollout_stats, args)
+        eval_business_score = _business_score(eval_stats, args) if eval_stats else float("nan")
+        metric_stats = eval_stats if eval_stats else rollout_stats
+        metric_business_score = float(eval_business_score) if eval_stats else float(collect_business_score)
+        merged_for_ckpt = {**rollout_stats, **update_stats, **eval_stats, "business_score": float(metric_business_score)}
         save_ckpt(
             path=outdir / "last.pt",
             model=model,
@@ -795,10 +922,9 @@ def main() -> None:
                 action_dim=action_dim,
                 metrics=merged_for_ckpt,
             )
-        for stage_name in stage_names_by_epoch.get(int(epoch), []):
-            stage_path = outdir / f"stage_{stage_name}.pt"
+        if bool(args.stage_snapshot_all):
             save_ckpt(
-                path=stage_path,
+                path=stage_snapshot_dir / f"epoch_{epoch:03d}.pt",
                 model=model,
                 optimizer=optimizer,
                 epoch=epoch,
@@ -807,11 +933,10 @@ def main() -> None:
                 action_dim=action_dim,
                 metrics=merged_for_ckpt,
             )
-
         if eval_stats:
-            sim_success = float(eval_stats.get("success_rate", -1.0))
-            if sim_success > best_sim_success:
-                best_sim_success = sim_success
+            sim_business = float(metric_business_score)
+            if sim_business > best_sim_business:
+                best_sim_business = sim_business
                 save_ckpt(
                     path=outdir / "best.pt",
                     model=model,
@@ -822,6 +947,19 @@ def main() -> None:
                     action_dim=action_dim,
                     metrics=merged_for_ckpt,
                 )
+                save_ckpt(
+                    path=outdir / "best_by_business.pt",
+                    model=model,
+                    optimizer=optimizer,
+                    epoch=epoch,
+                    args=args,
+                    obs_dim=obs_dim,
+                    action_dim=action_dim,
+                    metrics=merged_for_ckpt,
+                )
+            sim_success = float(eval_stats.get("success_rate", -1.0))
+            if sim_success > best_sim_success:
+                best_sim_success = sim_success
                 save_ckpt(
                     path=outdir / "best_by_success.pt",
                     model=model,
@@ -875,17 +1013,20 @@ def main() -> None:
             "success_rate": float(rollout_stats.get("success_rate", 0.0)),
             "mcs_avg_income": float(rollout_stats.get("mcs_avg_income", 0.0)),
             "ev_avg_wait_minutes": float(rollout_stats.get("avg_wait_minutes", 0.0)),
+            "business_score": float(collect_business_score),
             "eval_reward": float(eval_stats.get("avg_total_agent_reward_per_ep", np.nan)) if eval_stats else float("nan"),
             "eval_success_rate": float(eval_stats.get("success_rate", np.nan)) if eval_stats else float("nan"),
             "eval_mcs_avg_income": float(eval_stats.get("mcs_avg_income", np.nan)) if eval_stats else float("nan"),
             "eval_ev_avg_wait_minutes": float(eval_stats.get("avg_wait_minutes", np.nan)) if eval_stats else float("nan"),
+            "eval_business_score": float(eval_business_score),
         }
         business_history.append(biz_row)
         print(
             f"epoch={epoch:03d} "
             f"collect_success={rollout_stats['success_rate']:.3f} "
             f"collect_wait={rollout_stats['avg_wait_minutes']:.2f}min "
-            f"reward={biz_row['reward']:.3f}",
+            f"reward={biz_row['reward']:.3f} "
+            f"biz={biz_row['business_score']:.2f}",
             flush=bool(args.log_flush),
         )
 
@@ -893,8 +1034,34 @@ def main() -> None:
     biz_png = outdir / "business_metrics.png"
     _save_business_metrics_csv(path=biz_csv, rows=business_history)
     _plot_business_metrics(path=biz_png, rows=business_history)
+    selected_stage_rows = _select_stage_rows(business_history)
+    if bool(args.stage_snapshot_all):
+        for stage_name, row in selected_stage_rows.items():
+            epoch_num = int(float(row["epoch"]))
+            src = stage_snapshot_dir / f"epoch_{epoch_num:03d}.pt"
+            dst = outdir / f"stage_{stage_name}.pt"
+            if src.exists():
+                shutil.copy2(src, dst)
+                ckpt = torch.load(dst, map_location="cpu")
+                ckpt["metrics"] = {**ckpt.get("metrics", {}), **row}
+                torch.save(ckpt, dst)
+                print(
+                    f"selected stage_{stage_name}.pt epoch={epoch_num:03d} "
+                    f"score={row['stage_metric_business_score']:.2f} role={row.get('stage_role', stage_name)}",
+                    flush=bool(args.log_flush),
+                )
+    best_summary = {
+        "best_by_business": float(best_sim_business),
+        "best_by_success": float(best_sim_success),
+        "best_by_reward": float(best_sim_reward),
+        "best_by_wait": float(best_sim_wait),
+        "stage_selection": selected_stage_rows,
+    }
+    with (outdir / "best_summary.json").open("w", encoding="utf-8") as f:
+        json.dump(best_summary, f, ensure_ascii=False, indent=2)
     print(f"saved business metrics: {biz_csv}")
     print(f"saved business plot: {biz_png}")
+    print(f"saved best summary: {outdir / 'best_summary.json'}")
     print(f"done: checkpoints/log in {outdir}")
 
 

@@ -725,22 +725,35 @@ class Environment:
         if not idle or not pending:
             return []
 
-        cost_matrix = [[haversine_distance(mcs.location, req["location"]) for req in pending] for mcs in idle]
+        # 1-to-many support via virtual service slots:
+        # each physical MCS can expose multiple service slots in one dispatch step.
+        capacity = int(max(1, self.config.get("mcs_service_parallel_capacity", 1)))
+        mcs_slots: List[MCS] = []
+        for mcs in idle:
+            for _ in range(capacity):
+                mcs_slots.append(mcs)
+
+        if not mcs_slots:
+            return []
+
+        cost_matrix = [[haversine_distance(mcs.location, req["location"]) for req in pending] for mcs in mcs_slots]
         pairs = hungarian_assignment(cost_matrix)
 
         assigned_ev_ids = set()
         events = []
-        for mcs_idx, req_idx in pairs:
-            mcs = idle[mcs_idx]
+        for slot_idx, req_idx in pairs:
+            mcs = mcs_slots[slot_idx]
             req = pending[req_idx]
-            distance_km = cost_matrix[mcs_idx][req_idx]
+            distance_km = cost_matrix[slot_idx][req_idx]
             if distance_km > mcs.service_radius_km:
                 continue
 
             charge_minutes = float(req.get("charge_minutes", 0.0))
+            required_kwh = float(req.get("required_kwh", 0.0))
             req_step = int(req.get("step", self.current_step))
             wait_steps = max(0, int(self.current_step) - int(req_step))
             travel_steps = self._travel_steps(distance_km)
+            income = required_kwh * float(mcs.price_per_kwh) - float(distance_km) * float(mcs.cost_per_km)
             mcs.location = req["location"]
             service_steps = self._reserve_mcs(mcs, travel_steps)
             assigned_ev_ids.add(req["ev_id"])
@@ -752,6 +765,8 @@ class Environment:
                     "action": "serve_request",
                     "ev_id": req["ev_id"],
                     "distance_km": round(distance_km, 3),
+                    "required_kwh": round(required_kwh, 4),
+                    "income": round(float(income), 4),
                     "travel_steps": int(travel_steps),
                     "charge_steps": int(max(1, int(np.ceil(charge_minutes / float(self.config.get("sim_step_minutes", 5)))))),
                     "service_steps": int(service_steps),
@@ -950,7 +965,11 @@ class Environment:
         timeout_penalty = float(cfg.get("reward_timeout_penalty", 0.0))
         timeout_wait_penalty = float(cfg.get("reward_timeout_wait_penalty", 0.0))
         pending_count_penalty = float(cfg.get("reward_pending_count_penalty", 0.0))
+        income_scale = float(cfg.get("reward_income_scale", 0.0))
         fast_service_bonus = float(cfg.get("reward_fast_service_bonus", 0.0))
+        success_rate_bonus = float(cfg.get("reward_success_rate_bonus", 0.0))
+        mcs_success_rate_bonus = float(cfg.get("reward_mcs_success_rate_bonus", 0.0))
+        wait_improvement_bonus = float(cfg.get("reward_wait_improvement_bonus", 0.0))
 
         shape_relocate_scale = float(cfg.get("reward_shape_relocate_scale", 0.3))
         shape_reinforce_scale = float(cfg.get("reward_shape_reinforce_scale", 0.5))
@@ -997,6 +1016,8 @@ class Environment:
 
         rewards = {agent: 0.0 for agent in self.agents}
         event_count_by_agent: Dict[str, int] = defaultdict(int)
+        served_events = 0
+        served_wait_sum = 0.0
 
         for e in events:
             agent = str(e["agent"])
@@ -1006,10 +1027,15 @@ class Environment:
             rewards[agent] -= empty_drive_penalty * float(e.get("distance_km", 0.0))
 
             if action == "serve_request":
+                served_events += 1
                 rewards[agent] += service_reward
+                if income_scale != 0.0:
+                    rewards[agent] += income_scale * float(e.get("income", 0.0))
                 wait_steps = float(max(0.0, float(e.get("wait_steps", 0.0))))
+                served_wait_sum += wait_steps
                 if fast_service_bonus > 0.0:
-                    rewards[agent] += fast_service_bonus * float(np.clip(1.0 - wait_steps / timeout_steps, 0.0, 1.0))
+                    fast_score = float(np.clip(1.0 - wait_steps / timeout_steps, 0.0, 1.0))
+                    rewards[agent] += fast_service_bonus * fast_score
                 if serve_wait_penalty > 0.0:
                     rewards[agent] -= serve_wait_penalty * wait_steps
             elif action == "reinforce_fcs":
@@ -1062,6 +1088,21 @@ class Environment:
             shared_timeout_penalty = timeout_total / float(agent_count)
             for agent in rewards:
                 rewards[agent] -= shared_timeout_penalty
+
+        if success_rate_bonus > 0.0 or mcs_success_rate_bonus > 0.0 or wait_improvement_bonus > 0.0:
+            step_mcs_requests = served_events + len(timeout_events) + pending_count
+            if step_mcs_requests > 0:
+                step_success_rate = float(served_events / max(1, step_mcs_requests))
+                shared_success_bonus = (
+                    success_rate_bonus * step_success_rate
+                    + mcs_success_rate_bonus * step_success_rate
+                ) / float(agent_count)
+                if wait_improvement_bonus > 0.0 and served_events > 0:
+                    served_avg_wait = served_wait_sum / float(served_events)
+                    wait_score = float(np.clip(1.0 - served_avg_wait / timeout_steps, 0.0, 1.0))
+                    shared_success_bonus += (wait_improvement_bonus * wait_score) / float(agent_count)
+                for agent in rewards:
+                    rewards[agent] += shared_success_bonus
 
         radius_km = max(1e-6, float(cfg.get("ppo_obs_radius_km", cfg.get("mcs_service_radius_km", 3.0))))
         total_mcs = len(self.mcs_list)

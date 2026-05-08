@@ -133,8 +133,27 @@ def parse_args() -> argparse.Namespace:
         help="Stage bins by training progress (epoch/total_epochs). When ==3: early/middle/best.",
     )
     p.add_argument("--max-trajs", type=int, default=12000, help="Final sample cap. In event-level mode this means max event windows.")
-    p.add_argument("--event-level", action=argparse.BooleanOptionalAction, default=True, help="Build event-level samples (single MCS) instead of full trajectories.")
+    p.add_argument(
+        "--trajs-per-episode",
+        type=int,
+        default=0,
+        help="How many agent trajectories to keep from each episode. <=0 keeps all agents.",
+    )
+    p.add_argument(
+        "--traj-selection",
+        type=str,
+        default="top_return",
+        choices=["top_return", "random"],
+        help="How to choose trajectories when --trajs-per-episode is positive.",
+    )
+    p.add_argument("--event-level", action=argparse.BooleanOptionalAction, default=False, help="Build event-level samples (single MCS) instead of full trajectories.")
     p.add_argument("--window-len", type=int, default=20, help="Context window length used in event-level mode.")
+    p.add_argument(
+        "--min-return-quantile",
+        type=float,
+        default=0.0,
+        help="Drop trajectories below this return quantile before mixing. 0 keeps all; 0.5 keeps the top half.",
+    )
     p.add_argument(
         "--balance-by",
         type=str,
@@ -237,6 +256,26 @@ def _load_ckpt_epoch_and_total(path: Path) -> Tuple[int, int]:
     return int(epoch), int(total_epochs)
 
 
+def _stage_override_from_name(path: Path, stage_bins: int) -> Optional[int]:
+    if stage_bins <= 1:
+        return 0
+    name = str(path).replace("\\", "/").lower()
+    stem = path.stem.lower()
+    if "stage_early" in stem or "/stage_early" in name:
+        return 0
+    if "stage_middle" in stem or "/stage_middle" in name:
+        return min(stage_bins - 1, max(0, stage_bins // 2))
+    if (
+        "best_by_business" in stem
+        or "best_by_reward" in stem
+        or "best_by_success" in stem
+        or "stage_best" in stem
+        or stem == "best"
+    ):
+        return stage_bins - 1
+    return None
+
+
 def _assign_stage_ids(ckpt_paths: List[Path], stage_bins: int) -> Tuple[Dict[str, int], Dict[int, str], Dict[str, int]]:
     n = len(ckpt_paths)
     if n <= 0:
@@ -253,6 +292,10 @@ def _assign_stage_ids(ckpt_paths: List[Path], stage_bins: int) -> Tuple[Dict[str
 
     for p in ckpt_paths:
         key = str(p)
+        override = _stage_override_from_name(p, stage_bins=stage_bins)
+        if override is not None:
+            stage_by_ckpt[key] = int(override)
+            continue
         ep = int(epochs.get(key, -1))
         denom = int(total_epochs.get(key, -1))
         if denom <= 0:
@@ -274,6 +317,44 @@ def _assign_stage_ids(ckpt_paths: List[Path], stage_bins: int) -> Tuple[Dict[str
     else:
         stage_name = {i: f"stage_{i}" for i in range(stage_bins)}
     return stage_by_ckpt, stage_name, epochs
+
+
+def _filter_records_by_return_quantile(records: List[TrajectoryRecord], min_quantile: float) -> List[TrajectoryRecord]:
+    q = float(min(max(min_quantile, 0.0), 1.0))
+    if q <= 0.0 or len(records) <= 1:
+        return records
+    returns = np.asarray([float(r.return0) for r in records], dtype=np.float32)
+    threshold = float(np.quantile(returns, q))
+    kept = [r for r in records if float(r.return0) >= threshold]
+    if not kept:
+        raise RuntimeError(
+            f"Return quantile filter removed all trajectories: min_return_quantile={q:.3f} threshold={threshold:.6g}"
+        )
+    print(
+        f"[build_ppo] return_filter q={q:.3f} threshold={threshold:.4f} "
+        f"kept={len(kept)}/{len(records)}"
+    )
+    return kept
+
+
+def _select_episode_trajectories(
+    trajs: List[AgentTrajectory],
+    keep_count: int,
+    mode: str,
+    rng: np.random.Generator,
+) -> List[AgentTrajectory]:
+    k = int(keep_count)
+    if k <= 0 or k >= len(trajs):
+        return trajs
+    if str(mode).lower() == "random":
+        idx = rng.choice(len(trajs), size=k, replace=False)
+        return [trajs[int(i)] for i in idx.tolist()]
+    order = sorted(
+        range(len(trajs)),
+        key=lambda i: float(trajs[i].returns_to_go[0, 0]) if trajs[i].returns_to_go.size > 0 else float("-inf"),
+        reverse=True,
+    )
+    return [trajs[int(i)] for i in order[:k]]
 
 
 def _build_source_plans(
@@ -634,6 +715,7 @@ def main() -> None:
     source_name_by_id: Dict[int, str] = {}
     stage_name_by_id: Dict[int, str] = {int(p.stage_id): str(p.stage_name) for p in plans}
     records: List[TrajectoryRecord] = []
+    agents_per_episode_hint = int(CONFIG.get("mcs_num", 20))
 
     total_requests = 0
     total_mcs_requests = 0
@@ -647,8 +729,16 @@ def main() -> None:
     print(
         f"[build_ppo] start total_episodes={total_episodes} deterministic={deterministic} "
         f"stratified_mix={bool(args.stratified_mix)} return_bins={int(args.return_bins)} "
-        f"ckpts={len(ckpt_paths)} seeds={len(env_seeds)} use_lstm_summary={cfg['use_lstm_summary']}"
+        f"ckpts={len(ckpt_paths)} seeds={len(env_seeds)} use_lstm_summary={cfg['use_lstm_summary']} "
+        f"event_level={bool(args.event_level)} max_samples={int(args.max_trajs)} "
+        f"agent_traj_hint={agents_per_episode_hint}/episode "
+        f"keep_trajs_per_episode={int(args.trajs_per_episode)} selection={args.traj_selection}"
     )
+    if bool(args.event_level):
+        print(
+            "[build_ppo] note: progress traj counts full agent trajectories collected before final "
+            "event-window sampling; --max-trajs caps final samples, not rollout episodes."
+        )
     if deterministic:
         print("[build_ppo] warning: deterministic=True may reduce behavior coverage.")
 
@@ -677,7 +767,13 @@ def main() -> None:
                 deterministic=deterministic,
                 max_steps=args.max_steps,
             )
-            for tr in trajs:
+            picked_trajs = _select_episode_trajectories(
+                trajs=trajs,
+                keep_count=int(args.trajs_per_episode),
+                mode=str(args.traj_selection),
+                rng=rng,
+            )
+            for tr in picked_trajs:
                 ret0 = float(tr.returns_to_go[0, 0]) if tr.returns_to_go.size > 0 else 0.0
                 records.append(
                     TrajectoryRecord(
@@ -709,6 +805,10 @@ def main() -> None:
 
     if not records:
         raise RuntimeError("No trajectories collected.")
+    records = _filter_records_by_return_quantile(
+        records=records,
+        min_quantile=float(args.min_return_quantile),
+    )
 
     if bool(args.stratified_mix):
         order = _stratified_mix_indices(records=records, return_bins=int(args.return_bins), rng=rng)

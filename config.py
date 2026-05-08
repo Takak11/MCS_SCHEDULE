@@ -69,6 +69,7 @@ CONFIG.update({
 
 CONFIG.update({
     "mcs_service_radius_km": 3,
+    "mcs_service_parallel_capacity": 1,
     "mcs_relocate_horizon_steps": 12,
     "mcs_reinforce_ev_per_step": 1.0,
     "mcs_relocate_hotspot_k": 15,
@@ -98,25 +99,29 @@ CONFIG.update({
 
 CONFIG.update({
     # Align optimization target toward higher service success and lower wait.
-    "reward_service_reward": 4.5,
-    "reward_fast_service_bonus": 1.5,
-    "reward_waiting_penalty": 0.12,
-    "reward_serve_wait_penalty": 0.05,
-    "reward_timeout_penalty": 3.0,
-    "reward_timeout_wait_penalty": 0.05,
-    "reward_pending_count_penalty": 0.015,
-    "reward_empty_drive_penalty": 0.015,
-    "reward_fcs_overload_penalty": 0.15,
+    "reward_service_reward": 6.0,
+    "reward_fast_service_bonus": 3.0,
+    "reward_waiting_penalty": 0.18,
+    "reward_serve_wait_penalty": 0.10,
+    "reward_timeout_penalty": 6.0,
+    "reward_timeout_wait_penalty": 0.12,
+    "reward_pending_count_penalty": 0.025,
+    "reward_empty_drive_penalty": 0.012,
+    "reward_fcs_overload_penalty": 0.10,
     "reward_crowd_penalty": 0.03,
-    "reward_invalid_action_penalty": 2.5,
+    "reward_invalid_action_penalty": 3.0,
+    "reward_success_rate_bonus": 2.0,
+    "reward_mcs_success_rate_bonus": 1.0,
+    "reward_wait_improvement_bonus": 0.8,
+    "reward_income_scale": 0.02,
 
-    "reward_shape_relocate_scale": 0.2,
-    "reward_shape_reinforce_scale": 0.25,
-    "reward_shape_stay_scale": 0.15,
-    "reward_shape_clip": 0.3,
+    "reward_shape_relocate_scale": 0.08,
+    "reward_shape_reinforce_scale": 0.10,
+    "reward_shape_stay_scale": 0.05,
+    "reward_shape_clip": 0.15,
     "reward_shape_value_congestion_weight": 0.5,
     "reward_shape_stay_demand_thr": 0.6,
     "reward_shape_stay_cong_thr": 0.8,
 
-    "reward_clip_abs": 8.0
+    "reward_clip_abs": 12.0
 })
