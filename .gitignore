@@ -1,3 +1,5 @@
 dataprocessor/dataset/
 result/
 dataset/
+.idea/
+__pycache__/
